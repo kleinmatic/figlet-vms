@@ -17,7 +17,6 @@
 #include <sys/types.h>
 
 #include <wchar.h>
-#include <arpa/inet.h>	/* for htonl() */
 
 #include "utf8.h"
 
@@ -31,7 +30,7 @@
 #define _BOM	0xfeff
 
 static int __wchar_forbitten(wchar_t sym);
-static int __utf8_forbitten(u_char octet);
+static int __utf8_forbitten(unsigned char octet);
 
 static int
 __wchar_forbitten(wchar_t sym)
@@ -45,7 +44,7 @@ __wchar_forbitten(wchar_t sym)
 }
 
 static int
-__utf8_forbitten(u_char octet)
+__utf8_forbitten(unsigned char octet)
 {
 
 	switch (octet) {
@@ -89,7 +88,7 @@ size_t
 utf8_to_wchar(const char *in, size_t insize, wchar_t *out, size_t outsize,
     int flags)
 {
-	u_char *p, *lim;
+	unsigned char *p, *lim;
 	wchar_t *wlim, high;
 	size_t n, total, i, n_bits;
 
@@ -97,7 +96,7 @@ utf8_to_wchar(const char *in, size_t insize, wchar_t *out, size_t outsize,
 		return (0);
 
 	total = 0;
-	p = (u_char *)in;
+	p = (unsigned char *)in;
 	lim = p + insize;
 	wlim = out + outsize;
 
@@ -219,8 +218,10 @@ size_t
 wchar_to_utf8(const wchar_t *in, size_t insize, char *out, size_t outsize,
     int flags)
 {
-	wchar_t *w, *wlim, ch;
-	u_char *p, *lim, *oc;
+	wchar_t *w, *wlim;
+	unsigned char *p, *lim;
+	unsigned char oc[4];
+	unsigned long wc;
 	size_t total, n;
 
 	if (in == NULL || insize == 0 || (outsize == 0 && out != NULL))
@@ -228,7 +229,7 @@ wchar_to_utf8(const wchar_t *in, size_t insize, char *out, size_t outsize,
 
 	w = (wchar_t *)in;
 	wlim = w + insize;
-	p = (u_char *)out;
+	p = (unsigned char *)out;
 	lim = p + outsize;
 	total = 0;
 	for (; w < wlim; w++) {
@@ -242,21 +243,22 @@ wchar_to_utf8(const wchar_t *in, size_t insize, char *out, size_t outsize,
 		if (*w == _BOM && (flags & UTF8_SKIP_BOM) != 0)
 			continue;
 
-		if (*w < 0) {
+		wc = (unsigned long)*w;
+		if (wc > 0x7fffffffUL) {
 			if ((flags & UTF8_IGNORE_ERROR) == 0)
 				return (0);
 			continue;
-		} else if (*w <= 0x0000007f)
+		} else if (wc <= 0x0000007fUL)
 			n = 1;
-		else if (*w <= 0x000007ff)
+		else if (wc <= 0x000007ffUL)
 			n = 2;
-		else if (*w <= 0x0000ffff)
+		else if (wc <= 0x0000ffffUL)
 			n = 3;
-		else if (*w <= 0x001fffff)
+		else if (wc <= 0x001fffffUL)
 			n = 4;
-		else if (*w <= 0x03ffffff)
+		else if (wc <= 0x03ffffffUL)
 			n = 5;
-		else /* if (*w <= 0x7fffffff) */
+		else /* if (wc <= 0x7fffffffUL) */
 			n = 6;
 
 		total += n;
@@ -268,8 +270,10 @@ wchar_to_utf8(const wchar_t *in, size_t insize, char *out, size_t outsize,
 			return (0);		/* no space left */
 
 		/* make it work under different endians */
-		ch = htonl(*w);
-		oc = (u_char *)&ch;
+		oc[0] = (unsigned char)((wc >> 24) & 0xffU);
+		oc[1] = (unsigned char)((wc >> 16) & 0xffU);
+		oc[2] = (unsigned char)((wc >>  8) & 0xffU);
+		oc[3] = (unsigned char)( wc        & 0xffU);
 		switch (n) {
 		case 1:
 			*p = oc[3];

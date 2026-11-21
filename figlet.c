@@ -40,36 +40,52 @@
 /* Release 2.2.3 by Claudio Matsuoka, 12 Jan 2011: BSD license, fixes */
 /* Release 2.2.4 by Claudio Matsuoka, 26 Jan 2011: tlf2 font support */
 /* Release 2.2.5 by Claudio Matsuoka, 31 May 2012: flc licensing, minor fixes */
+/* OpenVMS Alpha version by Claude Fable 5.2 (Anthropic), 21 Nov 2026:
+   DCL command syntax, /LIST and /SAMPLES, VMS-only source */
+
+/* OpenVMS version: DCL command line (FIGLET_CLD.CLD and CLI$ routines),
+   font directory found from the image location, /LIST and /SAMPLES.
+   This version builds on OpenVMS only. */
 
 /*---------------------------------------------------------------------------
-  DEFAULTFONTDIR and DEFAULTFONTFILE should be defined in the Makefile.
-  DEFAULTFONTDIR is the full path name of the directory in which FIGlet
-    will search first for fonts (the ".flf" files).
-  DEFAULTFONTFILE is the filename of the font to be used if no other
-    is specified (standard.flf is recommended, but any other can be
-    used). This file should reside in the directory specified by
-    DEFAULTFONTDIR.
+  DEFAULTFONTFILE is the name of the font to be used if no other is
+    specified ("standard" is recommended).  This file must be in the
+    font directory.
+  The default font directory is found at run time.  See defaultfontdir().
 ---------------------------------------------------------------------------*/
-#ifndef DEFAULTFONTDIR
-#define DEFAULTFONTDIR "fonts"
-#endif
 #ifndef DEFAULTFONTFILE
-#define DEFAULTFONTFILE "standard.flf"
+#define DEFAULTFONTFILE "standard"
 #endif
 
 #include <stdio.h>
-#ifdef __STDC__
 #include <stdlib.h>
-#endif
 #include <string.h>
 #include <ctype.h>
-#include <sys/stat.h>
-#include <fcntl.h>     /* Needed for get_columns */
 
-#if defined(unix) || defined(__unix__) || defined(__APPLE__)
-#include <unistd.h>
-#include <sys/ioctl.h> /* Needed for get_columns */
+#include <descrip.h>
+#include <climsgdef.h>
+#include <dcdef.h>
+#include <dvidef.h>
+#include <jpidef.h>
+#include <lib$routines.h>
+#include <stsdef.h>
+
+#ifndef isascii
+#define isascii(c) (((unsigned long)(c)) <= 0x7fUL)
 #endif
+
+/* CLI$ routines.  Declared here because old compilers have no
+   <cli$routines.h>. */
+extern unsigned int cli$dcl_parse();
+extern unsigned int cli$present();
+extern unsigned int cli$get_value();
+
+/* The command table.  SET COMMAND/OBJECT makes it from FIGLET_CLD.CLD.
+   The name is the MODULE name in that file. */
+extern void *figlet_cld;
+
+#define CMDBUFLEN 1024   /* Maximum length of the command line */
+#define NAMEBUFLEN 256   /* Maximum length of a file specification */
 
 #ifdef TLF_FONTS
 #include <wchar.h>
@@ -80,11 +96,6 @@
 #include "zipio.h"     /* Package for reading compressed files */
 
 #define MYSTRLEN(x) ((int)strlen(x)) /* Eliminate ANSI problem */
-
-#define DIRSEP '/'
-#define DIRSEP2 '\\'
-/* Leave alone for Unix and MS-DOS/Windows!
-Note: '/' also used in filename in get_columns(). */
 
 #define FONTFILESUFFIX ".flf"
 #define FONTFILEMAGICNUMBER "flf2"
@@ -133,8 +144,8 @@ inchr gn[4]; /* Gn character sets: ASCII, Latin-1, none, none */
 int gl; /* 0-3 specifies left-half Gn character set */
 int gr; /* 0-3 specifies right-half Gn character set */
 
-int Myargc;  /* to avoid passing around argc and argv */
-char **Myargv;
+char *message;   /* Message from the command line, or NULL */
+int messagepos;  /* Position of the next character to read in message */
 
 /****************************************************************************
 
@@ -153,7 +164,7 @@ typedef char outchr; /* "char" written to stdout */
 #define STRLEN(x) MYSTRLEN(x)
 #define STRCPY(x,y) strcpy((x),(y))
 #define STRCAT(x,y) strcat((x),(y))
-#define ISSPACE(x) isspace(x)
+#define ISSPACE(x) isspace((unsigned char)(x))
 #endif
 
 typedef struct fc {
@@ -201,6 +212,7 @@ comnode *commandlist,**commandlistend;
 
 int deutschflag,justification,paragraphflag,right2left,multibyte;
 int cmdinput;
+int listflag,samplesflag;
 
 #define SM_SMUSH 128
 #define SM_KERN 64
@@ -243,29 +255,62 @@ int charheight;
 char *myname;
 
 
-#ifdef TIOCGWINSZ
+/****************************************************************************
+
+  setdsc
+
+  Makes a fixed-length string descriptor for the given storage.
+
+****************************************************************************/
+
+void setdsc(dsc,str,len)
+struct dsc$descriptor_s *dsc;
+char *str;
+int len;
+{
+  dsc->dsc$w_length = (unsigned short)len;
+  dsc->dsc$b_dtype = DSC$K_DTYPE_T;
+  dsc->dsc$b_class = DSC$K_CLASS_S;
+  dsc->dsc$a_pointer = str;
+}
+
+
 /****************************************************************************
 
   get_columns
 
-  Determines the number of columns of /dev/tty.  Returns the number of
-  columns, or -1 if error.  May return 0 if columns unknown.
-  Requires include files <fcntl.h> and <sys/ioctl.h>.
-  by Glenn Chappell & Ian Chai 14 Apr 1993
+  Determines the terminal width via LIB$GETDVI(DVI$_DEVBUFSIZ) on
+  SYS$OUTPUT, falling back to TT if SYS$OUTPUT is not a terminal.
+  Returns the number of columns, or -1 if error.
 
 ****************************************************************************/
 
 int get_columns()
 {
-  struct winsize ws;
-  int fd,result;
+  static $DESCRIPTOR(sysout_desc, "SYS$OUTPUT");
+  static $DESCRIPTOR(tt_desc, "TT");
+  struct dsc$descriptor_s *devs[2];
+  int item_class = DVI$_DEVCLASS;
+  int item_width = DVI$_DEVBUFSIZ;
+  int devclass, width;
+  unsigned int status;
+  int i;
 
-  if ((fd = open("/dev/tty",O_WRONLY))<0) return -1;
-  result = ioctl(fd,TIOCGWINSZ,&ws);
-  close(fd);
-  return result?-1:ws.ws_col;
+  devs[0] = &sysout_desc;
+  devs[1] = &tt_desc;
+  for (i = 0; i < 2; i++) {
+    devclass = 0;
+    status = lib$getdvi(&item_class, 0, devs[i], &devclass, 0, 0);
+    if ($VMS_STATUS_SUCCESS(status) && devclass == DC$_TERM) {
+      width = 0;
+      status = lib$getdvi(&item_width, 0, devs[i], &width, 0, 0);
+      if ($VMS_STATUS_SUCCESS(status) && width > 0) {
+        return width;
+      }
+    }
+  }
+  return -1;
 }
-#endif /* ifdef TIOCGWINSZ */
 
 
 /****************************************************************************
@@ -277,21 +322,13 @@ int get_columns()
 
 ****************************************************************************/
 
-#ifdef __STDC__
 char *myalloc(size_t size)
-#else
-char *myalloc(size)
-int size;
-#endif
 {
   char *ptr;
-#ifndef __STDC__
-  extern void *malloc();
-#endif
 
   if ((ptr = (char*)malloc(size))==NULL) {
     fprintf(stderr,"%s: Out of memory\n",myname);
-    exit(1);
+    exit(EXIT_FAILURE);
     }
   else {
     return ptr;
@@ -303,17 +340,16 @@ int size;
 
   hasdirsep
 
-  Returns true if s1 contains a DIRSEP or DIRSEP2 character.
+  Returns true if s1 contains a device or directory delimiter.
 
 ****************************************************************************/
 
 int hasdirsep(s1)
 char *s1;
 {
-  if (strchr(s1, DIRSEP)) return 1;
-  else if (strchr(s1, DIRSEP2)) return 1;
-  else return 0;
+  return strpbrk(s1,":[]<>")!=NULL;
 }
+
 
 /****************************************************************************
 
@@ -334,7 +370,7 @@ char *s2;
   if (len2 > len1) return 0;
   s1 += len1 - len2;
   while (*s1) {
-    if (tolower(*s1) != tolower(*s2)) return 0;
+    if (tolower((unsigned char)*s1) != tolower((unsigned char)*s2)) return 0;
     s1++;
     s2++;
     }
@@ -409,13 +445,13 @@ ZFILE *fp;
 void printusage(out)
 FILE *out;
 {
-  fprintf(out,
-    "Usage: %s [ -cklnoprstvxDELNRSWX ] [ -d fontdirectory ]\n",
-    myname);
-  fprintf(out,
-    "              [ -f fontfile ] [ -m smushmode ] [ -w outputwidth ]\n");
-  fprintf(out,
-    "              [ -C controlfile ] [ -I infocode ] [ message ]\n");
+  fprintf(out,"Usage: FIGLET [qualifiers] [\"message\"]\n");
+  fprintf(out,"  /FONT=name  /DIRECTORY=fontdir  /CONTROL=(file[,...])\n");
+  fprintf(out,"  /WIDTH=columns  /TERMINAL  /JUSTIFY=LEFT|CENTER|RIGHT\n");
+  fprintf(out,"  /[NO]RIGHT_TO_LEFT  /PARAGRAPH  /GERMAN\n");
+  fprintf(out,"  /SPACING=SMUSH|KERN|FULL_WIDTH|OVERLAP  /SMUSH_MODE=number\n");
+  fprintf(out,"  /INPUT=file  /OUTPUT=file\n");
+  fprintf(out,"  /LIST  /SAMPLES  /VERSION  /INFO=infocode\n");
 }
 
 
@@ -497,7 +533,7 @@ void skipws(fp)
 ZFILE *fp;
 {
   int c;
-  while (c=Zgetc(fp),isascii(c)&&isspace(c)) ;
+  while (c=Zgetc(fp),isascii(c)&&isspace((unsigned char)c)) ;
   Zungetc(c,fp);
   }
 
@@ -545,7 +581,7 @@ inchr *nump;
     }
 
   while((c=Zgetc(fp))!=EOF) {
-    c=toupper(c);
+    c=toupper((unsigned char)c);
     p=strchr(digits,c);
     if (!p) {
       Zungetc(c,fp);
@@ -689,7 +725,8 @@ ZFILE *controlfile;
   FIGopen
 
   Given a FIGlet font or control file name and suffix, return the file
-  or NULL if not found
+  or NULL if not found.  If the name has no device or directory, the
+  font directory is searched first.
 
 ****************************************************************************/
 
@@ -699,32 +736,32 @@ char *suffix;
 {
   char *fontpath;
   ZFILE *fontfile;
-  struct stat st;
   int namelen;
+  char last;
 
   namelen = MYSTRLEN(fontdirname);
-  fontpath = (char*)alloca(sizeof(char)*
+  fontpath = (char*)myalloc(sizeof(char)*
     (namelen+MYSTRLEN(name)+MYSTRLEN(suffix)+2));
   fontfile = NULL;
-  if (!hasdirsep(name)) {  /* not a full path name */
+  if (!hasdirsep(name)) {  /* no device or directory in the name */
     strcpy(fontpath,fontdirname);
-    fontpath[namelen] = DIRSEP;
-    fontpath[namelen+1] = '\0';
+    last = namelen>0 ? fontdirname[namelen-1] : ':';
+    if (last!=':' && last!=']' && last!='>') {
+      strcat(fontpath,":");  /* a logical name without the colon */
+      }
     strcat(fontpath,name);
     strcat(fontpath,suffix);
-    if(stat(fontpath,&st)==0) goto ok;
+    fontfile = Zopen(fontpath,"rb");
     }
-  /* just append suffix */
-  strcpy(fontpath,name);
-  strcat(fontpath,suffix);
-  if(stat(fontpath,&st)==0) goto ok;
-
-  return NULL;
-
-ok:
-  fontfile = Zopen(fontpath,"rb");
+  if (fontfile==NULL) {  /* just append suffix */
+    strcpy(fontpath,name);
+    strcat(fontpath,suffix);
+    fontfile = Zopen(fontpath,"rb");
+    }
+  free(fontpath);
   return fontfile;
 }
+
 
 /****************************************************************************
 
@@ -749,7 +786,7 @@ char *controlname;
   if (controlfile==NULL) {
     fprintf(stderr,"%s: %s: Unable to open control file\n",myname,
       controlname);
-    exit(1);
+    exit(EXIT_FAILURE);
     }
 
   (*commandlistend) = (comnode*)myalloc(sizeof(comnode));
@@ -902,32 +939,112 @@ void clearcfilelist()
 
 /****************************************************************************
 
+  clipresent, clivalue
+
+  Interfaces to CLI$PRESENT and CLI$GET_VALUE.
+  clipresent returns 1 if the entity is present, -1 if it is negated
+  (/NOxxx), and 0 if it is absent.
+  clivalue returns the next value of the entity in newly allocated
+  storage, or NULL if there are no more values.
+
+****************************************************************************/
+
+int clipresent(entity)
+char *entity;
+{
+  struct dsc$descriptor_s entdsc;
+  unsigned int status;
+
+  setdsc(&entdsc,entity,MYSTRLEN(entity));
+  status = cli$present(&entdsc);
+  if (status==CLI$_NEGATED || status==CLI$_LOCNEG) return -1;
+  return $VMS_STATUS_SUCCESS(status) ? 1 : 0;
+}
+
+char *clivalue(entity)
+char *entity;
+{
+  struct dsc$descriptor_s entdsc,valdsc;
+  char buf[CMDBUFLEN];
+  unsigned short len;
+  unsigned int status;
+  char *value;
+
+  setdsc(&entdsc,entity,MYSTRLEN(entity));
+  setdsc(&valdsc,buf,CMDBUFLEN-1);
+  len = 0;
+  status = cli$get_value(&entdsc,&valdsc,&len);
+  if (!$VMS_STATUS_SUCCESS(status)) return NULL;
+  value = myalloc((size_t)len+1);
+  memcpy(value,buf,len);
+  value[len] = '\0';
+  return value;
+}
+
+
+/****************************************************************************
+
+  defaultfontdir
+
+  Returns the default font directory.
+  If the logical name FIGLET_FONTS is defined, this is "FIGLET_FONTS:".
+  If not, this is the subdirectory [.FONTS] of the directory that
+  contains the FIGLET image.  Thus no setup procedure is necessary.
+
+****************************************************************************/
+
+char *defaultfontdir()
+{
+  struct dsc$descriptor_s imgdsc;
+  char image[NAMEBUFLEN];
+  char *dir,*p,*close;
+  unsigned short len;
+  unsigned int status;
+  int item;
+
+  if (getenv("FIGLET_FONTS")!=NULL) return "FIGLET_FONTS:";
+
+  setdsc(&imgdsc,image,NAMEBUFLEN-1);
+  item = JPI$_IMAGNAME;
+  len = 0;
+  status = lib$getjpi(&item,0,0,0,&imgdsc,&len);
+  if (!$VMS_STATUS_SUCCESS(status)) return "[.FONTS]";
+  image[len] = '\0';
+
+  /* "DEV:[DIR]FIGLET.EXE;1" -> "DEV:[DIR.FONTS]" */
+  close = NULL;
+  for (p=image;*p;p++) {
+    if (*p==']' || *p=='>') close = p;
+    }
+  if (close==NULL) return "[.FONTS]";
+  dir = myalloc((size_t)(close-image)+MYSTRLEN(".FONTS]")+1);
+  memcpy(dir,image,(size_t)(close-image));
+  sprintf(dir+(close-image),".FONTS%c",*close);
+  return dir;
+}
+
+
+/****************************************************************************
+
   getparams
 
   Handles all command-line parameters.  Puts all parameters within
-  bounds.
+  bounds.  The command line uses DCL syntax.  The command table is in
+  FIGLET_CLD.CLD; CLI$DCL_PARSE parses the command line.
 
 ****************************************************************************/
 
 void getparams()
 {
-  extern char *optarg;
-  extern int optind;
-  int c; /* "Should" be a char -- need int for "!= -1" test*/
-  int columns,infoprint;
-  char *controlname,*env;
+  struct dsc$descriptor_s cmddsc;
+  char cmd[CMDBUFLEN+16],paramname[4];
+  char *value,*controlname,*part;
+  unsigned short len;
+  unsigned int status;
+  int columns,infoprint,i,state;
 
-  if ((myname = strrchr(Myargv[0],DIRSEP))!=NULL) {
-    myname++;
-    }
-  else {
-    myname = Myargv[0];
-    }
-  fontdirname = DEFAULTFONTDIR;
-  env = getenv("FIGLET_FONTDIR");
-  if (env!=NULL) {
-    fontdirname = env;
-    }
+  myname = "figlet";
+  fontdirname = NULL;
   fontname = DEFAULTFONTFILE;
   cfilelist = NULL;
   cfilelistend = &cfilelist;
@@ -940,161 +1057,160 @@ void getparams()
   paragraphflag = 0;
   infoprint = -1;
   cmdinput = 0;
+  message = NULL;
+  messagepos = 0;
+  listflag = 0;
+  samplesflag = 0;
   outputwidth = DEFAULTCOLUMNS;
   gn[1] = 0x80;
   gr = 1;
-  while ((c = getopt(Myargc,Myargv,"ADEXLRI:xlcrpntvm:w:d:f:C:NFskSWo"))!= -1) {
-      /* Note: -F is not a legal option -- prints a special err message.  */
-    switch (c) {
-      case 'A':
-        cmdinput = 1;
-        break;
-      case 'D':
-        deutschflag = 1;
-        break;
-      case 'E':
-        deutschflag = 0;
-        break;
-      case 'X':
-        right2left = -1;
-        break;
-      case 'L':
-        right2left = 0;
-        break;
-      case 'R':
-        right2left = 1;
-        break;
-      case 'x':
-        justification = -1;
-        break;
-      case 'l':
-        justification = 0;
-        break;
-      case 'c':
-        justification = 1;
-        break;
-      case 'r':
-        justification = 2;
-        break;
-      case 'p':
-        paragraphflag = 1;
-        break;
-      case 'n':
-        paragraphflag = 0;
-        break;
-      case 's':
-        smushoverride = SMO_NO;
-        break;
-      case 'k':
+
+  /* Get the command line without the verb, then parse "FIGLET <line>". */
+  strcpy(cmd,"FIGLET ");
+  setdsc(&cmddsc,cmd+7,CMDBUFLEN-1);
+  len = 0;
+  status = lib$get_foreign(&cmddsc,0,&len,0);
+  if (!$VMS_STATUS_SUCCESS(status)) {
+    exit(status);
+    }
+  setdsc(&cmddsc,cmd,7+len);
+  status = cli$dcl_parse(&cmddsc,&figlet_cld,lib$get_input,lib$get_input,0);
+  if (!$VMS_STATUS_SUCCESS(status)) {
+    /* DCL has shown the error message. */
+    printusage(stderr);
+    exit(status | STS$M_INHIB_MSG);
+    }
+
+  if ((value = clivalue("OUTPUT"))!=NULL) {
+    if (freopen(value,"w",stdout)==NULL) {
+      fprintf(stderr,"%s: %s: Unable to open output file\n",myname,value);
+      exit(EXIT_FAILURE);
+      }
+    }
+  if ((value = clivalue("INPUT"))!=NULL) {
+    if (freopen(value,"r",stdin)==NULL) {
+      fprintf(stderr,"%s: %s: Unable to open input file\n",myname,value);
+      exit(EXIT_FAILURE);
+      }
+    }
+
+  if ((value = clivalue("DIRECTORY"))!=NULL) {
+    fontdirname = value;
+    }
+  if (fontdirname==NULL) {
+    fontdirname = defaultfontdir();
+    }
+
+  if ((value = clivalue("FONT"))!=NULL) {
+    fontname = value;
+    if (suffixcmp(fontname,FONTFILESUFFIX)) {
+      fontname[MYSTRLEN(fontname)-FSUFFIXLEN] = '\0';
+      }
+#ifdef TLF_FONTS
+    else if (suffixcmp(fontname,TOILETFILESUFFIX)) {
+      fontname[MYSTRLEN(fontname)-TSUFFIXLEN] = '\0';
+      }
+#endif
+    }
+
+  while ((controlname = clivalue("CONTROL"))!=NULL) {
+    if (suffixcmp(controlname, CONTROLFILESUFFIX)) {
+      controlname[MYSTRLEN(controlname)-CSUFFIXLEN] = '\0';
+      }
+    (*cfilelistend) = (cfnamenode*)myalloc(sizeof(cfnamenode));
+    (*cfilelistend)->thename = controlname;
+    cfilelistend = &(*cfilelistend)->next;
+    (*cfilelistend) = NULL;
+    }
+
+  if ((value = clivalue("JUSTIFY"))!=NULL) {
+    switch (value[0]) {
+      case 'L': justification = 0; break;
+      case 'C': justification = 1; break;
+      case 'R': justification = 2; break;
+      }
+    }
+
+  state = clipresent("RIGHT_TO_LEFT");
+  if (state>0) right2left = 1;
+  else if (state<0) right2left = 0;
+
+  if (clipresent("PARAGRAPH")>0) paragraphflag = 1;
+  if (clipresent("GERMAN")>0) deutschflag = 1;
+
+  if ((value = clivalue("SPACING"))!=NULL) {
+    switch (value[0]) {
+      case 'K':  /* KERN */
         smushmode = SM_KERN;
         smushoverride = SMO_YES;
         break;
-      case 'S':
+      case 'S':  /* SMUSH */
         smushmode = SM_SMUSH;
-	smushoverride = SMO_FORCE;
+        smushoverride = SMO_FORCE;
         break;
-      case 'o':
+      case 'O':  /* OVERLAP */
         smushmode = SM_SMUSH;
-	smushoverride = SMO_YES;
+        smushoverride = SMO_YES;
         break;
-      case 'W':
+      case 'F':  /* FULL_WIDTH */
         smushmode = 0;
-	smushoverride = SMO_YES;
+        smushoverride = SMO_YES;
         break;
-      case 't':
-#ifdef TIOCGWINSZ
-        columns = get_columns();
-        if (columns>0) {
-          outputwidth = columns;
-          }
-#else /* ifdef TIOCGWINSZ */
-        fprintf(stderr,
-          "%s: \"-t\" is disabled, since ioctl is not fully implemented.\n",
-          myname);
-#endif /* ifdef TIOCGWINSZ */
-        break;
-      case 'v':
-        infoprint = 0;
-        break;
-      case 'I':
-        infoprint = atoi(optarg);
-        break;
-      case 'm':
-        smushmode = atoi(optarg);
-        if (smushmode < -1) {
-          smushoverride = SMO_NO;
-          break;
-          }
-	if (smushmode == 0) smushmode = SM_KERN;
-	else if (smushmode == -1) smushmode = 0;
-	else smushmode = (smushmode & 63) | SM_SMUSH;
-	smushoverride = SMO_YES;
-        break;
-      case 'w':
-        columns = atoi(optarg);
-        if (columns>0) {
-          outputwidth = columns;
-          }
-        break;
-      case 'd':
-        fontdirname = optarg;
-        break;
-      case 'f':
-        fontname = optarg;
-        if (suffixcmp(fontname,FONTFILESUFFIX)) {
-          fontname[MYSTRLEN(fontname)-FSUFFIXLEN] = '\0';
-          }
-#ifdef TLF_FONTS
-        else if (suffixcmp(fontname,TOILETFILESUFFIX)) {
-          fontname[MYSTRLEN(fontname)-TSUFFIXLEN] = '\0';
-          }
-#endif
-        break;
-      case 'C':
-        controlname = optarg;
-        if (suffixcmp(controlname, CONTROLFILESUFFIX)) {
-          controlname[MYSTRLEN(controlname)-CSUFFIXLEN] = '\0';
-          }
-        (*cfilelistend) = (cfnamenode*)myalloc(sizeof(cfnamenode));
-        (*cfilelistend)->thename = controlname;
-        cfilelistend = &(*cfilelistend)->next;
-        (*cfilelistend) = NULL;
-        break;
-      case 'N':
-        clearcfilelist();
-        multibyte = 0;
-        gn[0] = 0;
-        gn[1] = 0x80;
-        gn[2] = gn[3] = 0;
-        gndbl[0] = gndbl[1] = gndbl[2] = gndbl[3] = 0;
-        gl = 0;
-        gr = 1;
-        break;
-      case 'F': /* Not a legal option */
-        fprintf(stderr,"%s: illegal option -- F\n",myname);
-        printusage(stderr);
-        fprintf(stderr,"\nBecause of numerous incompatibilities, the");
-        fprintf(stderr," \"-F\" option has been\n");
-        fprintf(stderr,"removed.  It has been replaced by the \"figlist\"");
-        fprintf(stderr," program, which is now\n");
-        fprintf(stderr,"included in the basic FIGlet package.  \"figlist\"");
-        fprintf(stderr," is also available\n");
-        fprintf(stderr,"from  http://www.figlet.org/");
-        fprintf(stderr,"under UNIX utilities.\n");
-        exit(1);
-        break;
-      default:
-        printusage(stderr);
-        exit(1);
       }
     }
-  if (optind!=Myargc) cmdinput = 1; /* force cmdinput if more arguments */
+
+  if ((value = clivalue("SMUSH_MODE"))!=NULL) {
+    smushmode = atoi(value);
+    if (smushmode >= -1) {
+      if (smushmode == 0) smushmode = SM_KERN;
+      else if (smushmode == -1) smushmode = 0;
+      else smushmode = (smushmode & 63) | SM_SMUSH;
+      smushoverride = SMO_YES;
+      }
+    }
+
+  if (clipresent("TERMINAL")>0) {
+    columns = get_columns();
+    if (columns>0) {
+      outputwidth = columns;
+      }
+    }
+  if ((value = clivalue("WIDTH"))!=NULL) {
+    columns = atoi(value);
+    if (columns>0) {
+      outputwidth = columns;
+      }
+    }
+
+  if (clipresent("VERSION")>0) infoprint = 0;
+  if ((value = clivalue("INFO"))!=NULL) {
+    infoprint = atoi(value);
+    }
+  if (clipresent("LIST")>0) listflag = 1;
+  if (clipresent("SAMPLES")>0) samplesflag = 1;
+
+  /* The message is parameters P1 thru P8, with one space between them. */
+  for (i=1;i<=8;i++) {
+    sprintf(paramname,"P%d",i);
+    if ((part = clivalue(paramname))==NULL) break;
+    if (message==NULL) {
+      message = part;
+      }
+    else {
+      value = myalloc((size_t)(MYSTRLEN(message)+MYSTRLEN(part)+2));
+      sprintf(value,"%s %s",message,part);
+      message = value;
+      }
+    }
+  if (message!=NULL) cmdinput = 1;
+
   outlinelenlimit = outputwidth-1;
   if (infoprint>=0) {
     printinfo(infoprint);
-    exit(0);
+    exit(EXIT_SUCCESS);
     }
 }
+
 
 
 /****************************************************************************
@@ -1197,7 +1313,7 @@ void readfont()
 
   if (fontfile==NULL) {
     fprintf(stderr,"%s: %s: Unable to open font file\n",myname,fontname);
-    exit(1);
+    exit(EXIT_FAILURE);
     }
 
   readmagic(fontfile,magicnum);
@@ -1213,7 +1329,7 @@ void readfont()
 
   if (maxlen > MAXLEN) {
     fprintf(stderr,"%s: %s: character is too wide\n",myname,fontname);
-    exit(1);
+    exit(EXIT_FAILURE);
     }
 #ifdef TLF_FONTS
   if ((!toiletfont && strcmp(magicnum,FONTFILEMAGICNUMBER)) ||
@@ -1222,7 +1338,7 @@ void readfont()
   if (strcmp(magicnum,FONTFILEMAGICNUMBER) || numsread<5) {
 #endif
     fprintf(stderr,"%s: %s: Not a FIGlet 2 font file\n",myname,fontname);
-    exit(1);
+    exit(EXIT_FAILURE);
     }
   for (i=1;i<=cmtlines;i++) {
     skiptoeol(fontfile);
@@ -1694,44 +1810,24 @@ inchr c;
   Agetchar
 
   Replacement to getchar().
-  Acts exactly like getchar if -A is NOT specified,
-  else obtains input from All remaining command line words.
+  Reads from the message on the command line if there is one.
+  If not, reads from the standard input (SYS$INPUT).
 
 ****************************************************************************/
 
 int Agetchar()
 {
-    extern int optind;		/* current argv[] element under study */
-    static int AgetMode = 0;	/* >= 0 for displacement into argv[n], <0 EOF */
-    char   *arg;		/* pointer to active character */
-    int    c;			/* current character */
+    int c;
 
-    if ( ! cmdinput )		/* is -A active? */
-	return( getchar() );	/* no: return stdin character */
+    if ( ! cmdinput )
+	return( getchar() );
 
-    if ( AgetMode < 0 || optind >= Myargc )		/* EOF is sticky: */
-	return( EOF );		/* **ensure it now and forever more */
-
-    /* find next character */
-    arg = Myargv[optind];		/* pointer to active arg */
-    c = arg[AgetMode++]&0xFF;	/* get appropriate char of arg */
-
-    if ( ! c )			/* at '\0' that terminates word? */
-    {   /* at end of word: return ' ' if normal word, '\n' if empty */
-	c = ' ';		/* suppose normal word and return blank */
-	if ( AgetMode == 1 )	/* if ran out in very 1st char, force \n */
-	    c = '\n';		/* (allows "hello '' world" to do \n at '') */
-	AgetMode = 0;		/* return to char 0 in NEXT word */
-	if ( ++optind >= Myargc )	/* run up word count and check if at "EOF" */
-	{   /* just ran out of arguments */
-	    c = EOF;		/* return EOF */
-	    AgetMode = -1;	/* ensure all future returns return EOF */
-	}
-    }
-
-    return( c );		/* return appropriate character */
-
-}	/* end: Agetchar() */
+    c = message[messagepos]&0xFF;
+    if ( ! c )			/* EOF is sticky */
+	return( EOF );
+    messagepos++;
+    return( c );
+}
 
 
 /****************************************************************************
@@ -1991,18 +2087,15 @@ inchr getinchr()
 
 /****************************************************************************
 
-  main
+  render
 
-  The main program, of course.
-  Reads characters 1 by 1 from stdin, and makes lines out of them using
-  addchar. Handles line breaking, (which accounts for most of the
+  Reads characters 1 by 1 from the input, and makes lines out of them
+  using addchar. Handles line breaking, (which accounts for most of the
   complexity in this function).
 
 ****************************************************************************/
 
-int main(argc,argv)
-int argc;
-char *argv[];
+void render()
 {
   inchr c,c2;
   int i;
@@ -2019,13 +2112,6 @@ char *argv[];
   int wordbreakmode;
   int char_not_added;
 
-  Myargc = argc;
-  Myargv = argv;
-  getparams();
-  readcontrolfiles();
-  readfont();
-  linealloc();
-
   wordbreakmode = 0;
   last_was_eol_flag = 0;
 
@@ -2037,9 +2123,9 @@ char *argv[];
 
     if (c=='\n'&&paragraphflag&&!last_was_eol_flag) {
       ungetinchr(c2 = getinchr());
-      c = ((isascii(c2)&&isspace(c2))?'\n':' ');
+      c = ((isascii(c2)&&isspace((unsigned char)c2))?'\n':' ');
       }
-    last_was_eol_flag = (isascii(c)&&isspace(c)&&c!='\t'&&c!=' ');
+    last_was_eol_flag = (isascii(c)&&isspace((unsigned char)c)&&c!='\t'&&c!=' ');
 
     if (deutschflag) {
       if (c>='[' && c<=']') {
@@ -2052,7 +2138,7 @@ char *argv[];
 
     c = handlemapping(c);
 
-    if (isascii(c)&&isspace(c)) {
+    if (isascii(c)&&isspace((unsigned char)c)) {
       c = (c=='\t'||c==' ') ? ' ' : '\n';
       }
 
@@ -2130,5 +2216,187 @@ char *argv[];
   if (outlinelen!=0) {
     printline();
     }
-  return 0;
+}
+
+
+/****************************************************************************
+
+  freefont
+
+  Releases the storage that readfont and linealloc allocated, so that
+  another font can be read.  Used by /SAMPLES.
+
+****************************************************************************/
+
+void freefont()
+{
+  fcharnode *fcptr,*fcnext;
+  int row;
+
+  for (fcptr=fcharlist;fcptr!=NULL;fcptr=fcnext) {
+    fcnext = fcptr->next;
+    for (row=0;row<charheight;row++) {
+      free(fcptr->thechar[row]);
+      }
+    free(fcptr->thechar);
+    free(fcptr);
+    }
+  fcharlist = NULL;
+  for (row=0;row<charheight;row++) {
+    free(outputline[row]);
+    }
+  free(outputline);
+  free(inchrline);
+}
+
+
+/****************************************************************************
+
+  nextfile
+
+  Finds the next file that matches "<font directory>*<suffix>".
+  Puts the file name, in lowercase and without device, directory, type
+  and version, in name.  Returns 0 when there are no more files.
+  The caller sets *context to 0 before the first call.
+
+****************************************************************************/
+
+int nextfile(suffix,context,name)
+char *suffix;
+unsigned int *context;
+char *name;
+{
+  char spec[NAMEBUFLEN*2],result[NAMEBUFLEN];
+  struct dsc$descriptor_s specdsc,resultdsc;
+  unsigned int status;
+  char *p,*start;
+  int i;
+
+  sprintf(spec,"%.*s*%s",NAMEBUFLEN,fontdirname,suffix);
+  setdsc(&specdsc,spec,MYSTRLEN(spec));
+  setdsc(&resultdsc,result,NAMEBUFLEN-1);
+  status = lib$find_file(&specdsc,&resultdsc,context,0,0,0,0);
+  if (!$VMS_STATUS_SUCCESS(status)) {
+    lib$find_file_end(context);
+    return 0;
+    }
+  result[NAMEBUFLEN-1] = '\0';
+  start = result;
+  for (p=result;*p!='\0'&&*p!=' ';p++) {
+    if (*p==']' || *p=='>' || *p==':') start = p+1;
+    }
+  for (i=0;start[i]!='\0'&&start[i]!='.'&&start[i]!=';'&&start[i]!=' ';i++) {
+    name[i] = (char)tolower((unsigned char)start[i]);
+    }
+  name[i] = '\0';
+  return 1;
+}
+
+
+/****************************************************************************
+
+  listfonts
+
+  /LIST: prints the default font, the font directory, and the names of
+  the fonts and control files in the font directory.
+
+****************************************************************************/
+
+void listfiles(suffix,heading,nonemsg)
+char *suffix;
+char *heading;
+char *nonemsg;
+{
+  unsigned int context;
+  char name[NAMEBUFLEN];
+  int count;
+
+  context = 0;
+  count = 0;
+  while (nextfile(suffix,&context,name)) {
+    if (count==0) printf("%s\n",heading);
+    count++;
+    printf("%s\n",name);
+    }
+  if (count==0 && nonemsg!=NULL) printf("%s\n",nonemsg);
+}
+
+void listfonts()
+{
+  printf("Default font: %s\n",DEFAULTFONTFILE);
+  printf("Font directory: %s\n",fontdirname);
+  listfiles(FONTFILESUFFIX,"Figlet fonts in this directory:",
+    "No figlet fonts in this directory");
+#ifdef TLF_FONTS
+  listfiles(TOILETFILESUFFIX,"TOIlet fonts in this directory:",(char*)NULL);
+#endif
+  listfiles(CONTROLFILESUFFIX,"Figlet control files in this directory:",
+    "No figlet control files in this directory");
+}
+
+
+/****************************************************************************
+
+  showsamples
+
+  /SAMPLES: prints the message in each font of the font directory.
+  If there is no message, prints the name of each font in that font.
+
+****************************************************************************/
+
+void showsamples()
+{
+  unsigned int context;
+  char name[NAMEBUFLEN];
+  char *sampletext;
+  int savesmushmode,saveright2left,savejustification;
+
+  sampletext = message;
+  savesmushmode = smushmode;
+  saveright2left = right2left;
+  savejustification = justification;
+  context = 0;
+  while (nextfile(FONTFILESUFFIX,&context,name)) {
+    smushmode = savesmushmode;
+    right2left = saveright2left;
+    justification = savejustification;
+    fontname = name;
+    message = (sampletext!=NULL) ? sampletext : name;
+    messagepos = 0;
+    cmdinput = 1;
+    getinchr_flag = 0;
+    printf("%s :\n",name);
+    readfont();
+    linealloc();
+    render();
+    freefont();
+    printf("\n\n");
+    }
+}
+
+
+/****************************************************************************
+
+  main
+
+  The main program, of course.
+
+****************************************************************************/
+
+int main()
+{
+  getparams();
+  if (listflag) {
+    listfonts();
+    return EXIT_SUCCESS;
+    }
+  readcontrolfiles();
+  if (samplesflag) {
+    showsamples();
+    return EXIT_SUCCESS;
+    }
+  readfont();
+  linealloc();
+  render();
+  return EXIT_SUCCESS;
 }

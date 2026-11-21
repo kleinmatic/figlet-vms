@@ -1,8 +1,5 @@
-chkfont
-figlet
-tags
-*.o
-core
+*.OBJ
+*.EXE
+*.LIS
+*.MAP
 *~
-tests.log
-*.tar.gz

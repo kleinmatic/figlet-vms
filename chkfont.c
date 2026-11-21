@@ -1,9 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#ifdef __STDC__
 #include <stdlib.h>
-#endif
 
 #define DATE "20 Feb 1996"
 #define VERSION "2.2"
@@ -71,7 +69,7 @@ char *ptr;
 ptr=(char *)malloc(size);
 if (ptr==NULL) {
   fprintf(stderr,"%s: Out of memory\n",myname);
-  exit(1);
+  exit(EXIT_FAILURE);
   }
 return(ptr);
 }
@@ -86,7 +84,7 @@ char *suffix;
   if (strlen(suffix) > 9) return 1;
   strcpy(ucsuffix,suffix);
   for (s = ucsuffix; *s; s++) {
-    *s = toupper(*s);
+    *s = (char)toupper((unsigned char)*s);
     }
 
   if (strlen(path)<strlen(suffix)) return 1;
@@ -103,7 +101,7 @@ fprintf(stderr,"Version: %s, date: %s\n",VERSION,DATE);
 fprintf(stderr,"Checks figlet 2.0/2.1 font files for format errors.\n");
 fprintf(stderr,"(Does not modify font files.)\n");
 fprintf(stderr,"Usage: %s fontfile ...\n",myname);
-exit(1);
+exit(EXIT_FAILURE);
 }
 
 void readchar()
@@ -233,7 +231,7 @@ else {
   fontfile=fopen(fontfilename,"r");
   if (fontfile == NULL) {
     fprintf(stderr,"%s: Could not open file '%s'\n",myname,fontfilename);
-    exit(1);
+    exit(EXIT_FAILURE);
     }
   }
 
@@ -451,7 +449,10 @@ if (spectagcnt!=-1 && spectagcnt!=codetagcnt) {
   weregone(0); if (gone) return;
   }
 
-if (fontfile!=stdin) fclose(fontfile);
+if (fontfile!=stdin && fontfile!=NULL) {
+  fclose(fontfile);
+  fontfile=NULL;
+  }
 
 weregone(1); if (gone) return;
 }
@@ -462,21 +463,29 @@ int argc;
 char *argv[];
 {
 int arg;
+char *p;
 
-if ((myname=strrchr(argv[0],'/'))!=NULL) {
-  myname++;
+myname = argv[0];
+for (p = argv[0]; *p; p++) {
+  if (*p == ']' || *p == '>' || *p == ':') {
+    myname = p + 1;
+    }
   }
-else {
-  myname = argv[0];
-  }
+/* Drop the file type and version: "figlet.exe;2" -> "figlet" */
+myname[strcspn(myname, ".;")] = '\0';
 if (argc<2) {
   usageerr();
   }
 for (arg=1;arg<argc;arg++) {
   fontfilename=argv[arg];
+  fontfile=NULL;
   fileline=NULL;
   checkit();
+  if (fontfile!=stdin && fontfile!=NULL) {
+    fclose(fontfile);
+    fontfile=NULL;
+    }
   if (fileline!=NULL) free(fileline);
   }
-return 0;
+return EXIT_SUCCESS;
 }

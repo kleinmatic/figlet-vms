@@ -137,7 +137,7 @@
  */
 
 #ifndef BUFFERTHRESHOLD
-#define BUFFERTHRESHOLD            (256 * 1024L)
+#define BUFFERTHRESHOLD            (16 * 1024 * 1024L)
 #endif
 
 #ifndef INPBUFSIZE
@@ -634,8 +634,44 @@ ZFILE *Zopen(const char *path, const char *mode)
       (zs->comp   !=                        8) ||
       (inplen     <= 30 + zs->flen + zs->elen)    )
   {
-    /* Initialize buffering */
-    BufferInitialize(zs, FALSE);
+    /*
+     * On OpenVMS, uncompressed font and control files may use RMS
+     * variable-length records (RFM=VAR/VFC) as well as Stream_LF.
+     * Byte-offset fseek/ftell on binary ("rb") streams is invalid on
+     * record-oriented RMS files, so reopen in text mode ("r") and
+     * stream-load sequentially into zipio's in-memory buffers.
+     */
+    int i;
+    size_t nread;
+
+    fclose(zs->OpenFile);
+    zs->OpenFile = fopen(path, "r");
+    if (!zs->OpenFile)
+    {
+      free(zs);
+      return NULL;
+    }
+
+    zs->getoff = -1;
+    zs->tmpfil = NULL;
+    zs->outinf = 0;
+    for (i = 0; i < PTRBUFSIZE; i++)
+      zs->ptrbuf[i] = NULL;
+
+    while ((nread = fread(zs->inpbuf, 1, INPBUFSIZE, zs->OpenFile)) > 0)
+    {
+      if (BufferAppend(zs, zs->inpbuf, (long) nread))
+      {
+        zs->errorencountered = TRUE;
+        break;
+      }
+    }
+    if (ferror(zs->OpenFile))
+      zs->errorencountered = TRUE;
+
+    zs->usiz = zs->outinf;
+    fclose(zs->OpenFile);
+    zs->OpenFile = NULL;
 
     zs->inflatestate = NULL;
   }
@@ -809,6 +845,13 @@ int Zclose(ZFILE *stream)
 
   /* terminate the buffering */
   BufferTerminate(ZS);
+
+  /* close the underlying input file */
+  if (ZS->OpenFile)
+  {
+    fclose(ZS->OpenFile);
+    ZS->OpenFile = NULL;
+  }
 
   /* free the ZipioState structure */
   free(ZS);
